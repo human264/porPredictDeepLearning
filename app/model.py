@@ -1,382 +1,563 @@
-import os, json, math, random
+# app/model.py
+import os, json
 import numpy as np
+import pandas as pd
+from typing import List, Dict, Tuple
+
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
+from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split
+from scipy import sparse
+import joblib
+import xgboost as xgb
+
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+
 from app.db import get_conn, dict_cur, get_schema
-from app.text import encode_text_to_tensor, CHARSET
+from app.text import encode_text_to_tensor, CHARSET, normalize_text
 
 S = get_schema()
 
-# --------------------- 장치/시드 ---------------------
-def set_global_seed(seed: int | None):
-    if seed is None: return
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+# --------------------- 설정 ---------------------
+CAT_COLS = ["mccsno","block","event","sign","deptcode","shiptype"]
+NUM_COLS = ["duration"]
 
-def _select_device():
-    pref = os.getenv("DEVICE_PREFERENCE", "auto").lower()
-    if pref in ("mps","metal"):
-        return torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+# 텍스트 인코더 선택: charcnn | hash (hash = 완전 CPU 경로 폴백)
+TEXT_ENCODER = os.getenv("TEXT_ENCODER", "charcnn").lower()
+
+# Char-CNN 하이퍼파라미터 (.env로 조정)
+CHARCNN_MAX_LEN   = int(os.getenv("CHARCNN_MAX_LEN", 1024))
+CHARCNN_EMB_DIM   = int(os.getenv("CHARCNN_EMB_DIM", 48))
+CHARCNN_OUT_CH    = int(os.getenv("CHARCNN_OUT_CH", 64))
+CHARCNN_KERNELS   = tuple(int(k) for k in (os.getenv("CHARCNN_KERNELS","2,3,4,5").split(",")))
+CHARCNN_DROPOUT   = float(os.getenv("CHARCNN_DROPOUT", "0.1"))
+CHARCNN_EPOCHS    = int(os.getenv("CHARCNN_EPOCHS", "2"))
+CHARCNN_LR        = float(os.getenv("CHARCNN_LR", "0.001"))
+CHARCNN_BS        = int(os.getenv("CHARCNN_BATCH", "256"))
+TORCH_DEVICE_PREF = os.getenv("TORCH_DEVICE", "auto").lower()  # auto|mps|cpu
+
+def _torch_device():
+    pref = TORCH_DEVICE_PREF  # auto|mps|cuda|cpu
     if pref == "cuda":
-        return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        return torch.device("cuda" if (torch.cuda.is_available()) else "cpu")
+    if pref == "mps":
+        return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    if pref == "cpu":
+        return torch.device("cpu")
+    # auto: 우선순위 cuda > mps > cpu
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
-DEVICE = _select_device()
-print(f"[hybrid-model] DEVICE={DEVICE}; mps_avail={torch.backends.mps.is_available()}")
+DEVICE = _torch_device()
 
-# --------------------- 문자 CNN ---------------------
-def _kernels():
-    ks = os.getenv("CNN_KERNEL_SIZES", "2,3,4,5")
-    return tuple(int(x) for x in ks.split(",") if x.strip())
+# 해시 벡터라이저(폴백) 설정
+HASH_N_FEATURES = int(os.getenv("XGB_HASH_FEATURES", str(2**18)))  # 262,144
+HASH_NGRAM_MIN  = int(os.getenv("XGB_CHAR_NGRAM_MIN", "3"))
+HASH_NGRAM_MAX  = int(os.getenv("XGB_CHAR_NGRAM_MAX", "5"))
+# --- replace _build_classifier ---
+def _build_classifier(num_class: int, force_method: str | None = None, force_predictor: str | None = None):
+    method, predictor = _choose_xgb_tree_and_predictor()
+    if force_method is not None:
+        method = force_method
+    if force_predictor is not None:
+        predictor = force_predictor
 
-EMB_DIM  = int(os.getenv("CNN_EMB_DIM", "48"))
-OUT_CH   = int(os.getenv("CNN_OUT_CH",  "64"))
-DROPOUT  = float(os.getenv("DROPOUT", "0.1"))
-KERNELS  = _kernels()
-VOCAB_SIZE = len(CHARSET) + 1
-MAX_ITEM_LEN = int(os.getenv("MAX_ITEM_LEN", "2048"))
-MLP_HIDDEN = int(os.getenv("MLP_HIDDEN", "256"))
+    clf = xgb.XGBClassifier(
+        n_estimators=int(os.getenv("XGB_N_ESTIMATORS", "800")),
+        learning_rate=float(os.getenv("XGB_LEARNING_RATE", "0.05")),
+        max_depth=int(os.getenv("XGB_MAX_DEPTH", "8")),
+        subsample=float(os.getenv("XGB_SUBSAMPLE", "0.9")),
+        colsample_bytree=float(os.getenv("XGB_COLSAMPLE_BYTREE", "0.9")),
+        reg_lambda=float(os.getenv("XGB_REG_LAMBDA", "1.0")),
+        reg_alpha=float(os.getenv("XGB_REG_ALPHA", "0.0")),
+        tree_method=method,                  # auto→gpu_hist/hist
+        predictor=predictor,                 # auto→gpu_predictor/auto
+        n_jobs=int(os.getenv("XGB_N_JOBS", "0")),
+        eval_metric="mlogloss",
+        objective="multi:softprob" if num_class > 2 else "binary:logistic",
+        num_class=num_class if num_class > 2 else None,
+    )
+    return clf
+# --------------------- 전역 상태 ---------------------
+MODELS: Dict[str, Dict] = {"item_act": None, "item_mr": None}
+DETAILS: Dict[str, Dict] = {"item_act": None, "item_mr": None}
+VERSIONS: Dict[str, int | None] = {"item_act": None, "item_mr": None}
 
-def auto_cat_dim(card: int) -> int:
-    # 카드inality에 따른 임베딩 차원 자동 산정
-    default = int(os.getenv("CAT_EMB_DIM_DEFAULT", "0") or "0")
-    if default > 0: return default
-    return min(64, max(4, int(round(card ** 0.25) * 8)))
+# --------------------- Char-CNN ---------------------
+VOCAB_SIZE = len(CHARSET) + 1  # 0=pad/unk
 
-class ItemCNNEncoder(nn.Module):
-    def __init__(self, vocab_size, emb_dim=EMB_DIM, out_ch=OUT_CH, kernels=KERNELS, dropout=DROPOUT):
+class CharCNNEncoder(nn.Module):
+    def __init__(self, vocab_size=VOCAB_SIZE, emb_dim=CHARCNN_EMB_DIM,
+                 out_ch=CHARCNN_OUT_CH, kernels=CHARCNN_KERNELS, dropout=CHARCNN_DROPOUT):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
         self.convs = nn.ModuleList([nn.Conv1d(emb_dim, out_ch, k) for k in kernels])
         self.dropout = nn.Dropout(dropout)
         self.out_dim = out_ch * len(kernels)
-    def forward(self, char_ids: torch.Tensor):
-        # char_ids: (L,)
-        x = self.emb(char_ids)           # (L,E)
-        x = x.transpose(0,1).unsqueeze(0)  # (1,E,L)
+
+    def forward(self, ids: torch.Tensor):  # ids: (B,L)
+        x = self.emb(ids)            # (B,L,E)
+        x = x.transpose(1, 2)        # (B,E,L)
         feats = []
         for conv in self.convs:
-            h = torch.relu(conv(x))      # (1,C,L')
-            h = torch.max(h, dim=2)[0]   # (1,C)
+            h = torch.relu(conv(x))  # (B,C,L')
+            h = torch.max(h, dim=2)[0]  # (B,C)
             feats.append(h)
-        z = torch.cat(feats, dim=1).squeeze(0)  # (C*|kernels|)
+        z = torch.cat(feats, dim=1)  # (B, C*|kernels|)
         return self.dropout(z)
 
-class HybridItemClassifier(nn.Module):
-    """
-    문자CNN(Text) + 카테고리 임베딩 + 수치피처(정규화) MLP → 분류
-    """
-    def __init__(self, num_classes: int, cat_cardinalities: dict[str,int],
-                 cat_emb_dims: dict[str,int], num_numeric: int):
+class CharCNNClassifier(nn.Module):
+    def __init__(self, num_classes: int):
         super().__init__()
-        self.text_enc = ItemCNNEncoder(VOCAB_SIZE)
-        self.cat_cols = list(cat_cardinalities.keys())
-        self.cat_emb = nn.ModuleDict({
-            col: nn.Embedding(cat_cardinalities[col], cat_emb_dims[col])
-            for col in self.cat_cols
-        })  # 0=UNK 포함하여 cardinality 반영
-        cat_total = sum(cat_emb_dims.values())
-        in_dim = self.text_enc.out_dim + cat_total + num_numeric
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, MLP_HIDDEN),
-            nn.ReLU(),
-            nn.Dropout(DROPOUT),
-            nn.Linear(MLP_HIDDEN, num_classes)
-        )
-    def forward(self, text_ids: torch.Tensor, cat_idxs: dict[str, torch.Tensor], num_feats: torch.Tensor):
-        tvec = self.text_enc(text_ids)  # (T)
-        embs = []
-        for col in self.cat_cols:
-            idx = cat_idxs[col].long().clamp(min=0)
-            embs.append(self.cat_emb[col](idx.unsqueeze(0)).squeeze(0))
-        x = torch.cat([tvec] + embs + [num_feats.float()], dim=0)
-        return self.mlp(x)
+        self.enc = CharCNNEncoder()
+        self.fc  = nn.Linear(self.enc.out_dim, num_classes)
 
-# --------------------- 전역 상태 ---------------------
-# 태스크별: item_act, item_mr
-MODELS = {
-    "item_act": None,
-    "item_mr":  None
-}
-DETAILS = {          # model_versions.details 캐시
-    "item_act": None,
-    "item_mr":  None
-}
-VERSIONS = {
-    "item_act": None,
-    "item_mr":  None
-}
+    def forward(self, ids: torch.Tensor):
+        z = self.enc(ids)           # (B, D)
+        return self.fc(z)           # (B, C)
+
+class TextDataset(Dataset):
+    def __init__(self, texts: List[str], labels: np.ndarray | None, max_len: int):
+        self.ids = [encode_text_to_tensor(t, max_len, device=torch.device("cpu")) for t in texts]
+        self.labels = None if labels is None else torch.tensor(labels, dtype=torch.long)
+    def __len__(self): return len(self.ids)
+    def __getitem__(self, i):
+        if self.labels is None:
+            return self.ids[i]
+        return self.ids[i], self.labels[i]
+
+def _collate(batch):
+    if isinstance(batch[0], tuple):
+        ids, ys = zip(*batch)
+        ids = pad_sequence(ids, batch_first=True, padding_value=0)
+        ys  = torch.stack(ys)
+        return ids.to(DEVICE), ys.to(DEVICE)
+    else:
+        ids = pad_sequence(batch, batch_first=True, padding_value=0)
+        return ids.to(DEVICE)
+
+@torch.no_grad()
+def _encode_charcnn(texts: List[str], enc: CharCNNEncoder, max_len: int, bs: int) -> np.ndarray:
+    enc.eval()
+    ds = TextDataset([normalize_text(t) for t in texts], labels=None, max_len=max_len)
+    dl = DataLoader(ds, batch_size=bs, shuffle=False, collate_fn=_collate)
+    vecs = []
+    for ids in dl:
+        z = enc(ids)               # (B, D)
+        vecs.append(z.detach().cpu().numpy())
+    return np.concatenate(vecs, axis=0).astype(np.float32)
+
+def _train_charcnn(texts: List[str], y: np.ndarray, num_classes: int) -> Tuple[CharCNNEncoder, Dict]:
+    ds = TextDataset([normalize_text(t) for t in texts], labels=y, max_len=CHARCNN_MAX_LEN)
+    dl = DataLoader(ds, batch_size=CHARCNN_BS, shuffle=True, collate_fn=_collate)
+
+    model = CharCNNClassifier(num_classes=num_classes).to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=CHARCNN_LR)
+    loss_fn = nn.CrossEntropyLoss()
+
+    model.train()
+    for epoch in range(CHARCNN_EPOCHS):
+        for ids, yy in dl:
+            logits = model(ids)
+            loss = loss_fn(logits, yy)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+    enc = model.enc  # 분류 헤드는 폐기하고 인코더만 사용
+    enc.eval()
+    info = {
+        "type": "charcnn",
+        "dim": int(enc.out_dim),
+        "max_len": CHARCNN_MAX_LEN,
+        "emb_dim": CHARCNN_EMB_DIM,
+        "out_ch": CHARCNN_OUT_CH,
+        "kernels": list(CHARCNN_KERNELS),
+        "dropout": CHARCNN_DROPOUT,
+        "device": "mps" if torch.backends.mps.is_available() else "cpu",
+    }
+    return enc, info
 
 # --------------------- 저장/로드 ---------------------
-def _save_model(ver: int, task: str, model: nn.Module, details: dict):
+def _save_model(ver: int, task: str, bundle: Dict, details: dict):
     os.makedirs("models", exist_ok=True)
-    path = f"./models/{task}_v{ver}.pt"
-    torch.save(model.state_dict(), path)
+    path = f"./models/{task}_v{ver}.joblib"
+    joblib.dump({"bundle": bundle, "details": details}, path)
     conn = get_conn(); cur = dict_cur(conn)
-    details_to_store = dict(details)
-    details_to_store["task"] = task
+    det = dict(details); det["task"] = task
     cur.execute(f"UPDATE {S}.model_versions SET details=%s WHERE version_id=%s",
-                (json.dumps(details_to_store), ver))
+                (json.dumps(det), ver))
     conn.commit(); cur.close(); conn.close()
     return path
 
-def _build_model_from_details(num_classes: int, details: dict) -> HybridItemClassifier:
-    cat_card = {k:int(v) for k,v in details["cat_cardinalities"].items()}
-    cat_emb_dims = {k:int(v) for k,v in details["cat_emb_dims"].items()}
-    num_numeric = len(details["numeric_stats"])
-    return HybridItemClassifier(num_classes, cat_card, cat_emb_dims, num_numeric).to(DEVICE)
-
-def _load_latest(task: str):
+def _load_latest_meta(task: str) -> Tuple[int | None, dict | None]:
     conn = get_conn(); cur = dict_cur(conn)
     cur.execute(f"""
       SELECT version_id, details
       FROM {S}.model_versions
       WHERE COALESCE(details->>'task','')=%s
-      ORDER BY version_id DESC LIMIT 1
+      ORDER BY version_id DESC
+      LIMIT 1
     """, (task,))
     row = cur.fetchone()
     cur.close(); conn.close()
     if not row: return None, None
-    ver, det = row["version_id"], (row["details"] or {})
-    return ver, det
+    return row["version_id"], (row["details"] or {})
 
 def load_latest(task: str):
-    ver, details = _load_latest(task)
-    if not ver or not details:
+    conn = get_conn(); cur = dict_cur(conn)
+    cur.execute(f"""
+      SELECT version_id, details
+      FROM {S}.model_versions
+      WHERE COALESCE(details->>'task','')=%s
+      ORDER BY version_id DESC
+      LIMIT 10
+    """, (task,))
+    rows = cur.fetchall(); cur.close(); conn.close()
+
+    chosen = None
+    for r in rows:
+        ver = r["version_id"]; det = r["details"] or {}
+        path = f"./models/{task}_v{ver}.joblib"
+        if os.path.exists(path):
+            chosen = (ver, det, path); break
+
+    if not chosen:
         MODELS[task] = None; DETAILS[task] = None; VERSIONS[task] = None; return
-    label_keys = details.get("label_keys", [])
-    model = _build_model_from_details(len(label_keys), details)
+
+    ver, details, path = chosen
     try:
-        state = torch.load(f"./models/{task}_v{ver}.pt", map_location=DEVICE)
-        model.load_state_dict(state, strict=False)
+        obj = joblib.load(path)
+        bundle = obj["bundle"]
+        # Char-CNN 상태 로딩 (필요 시)
+        tinfo = (obj.get("details") or details).get("text_encoder", {})
+        if tinfo.get("type") == "charcnn":
+            # 인코더 state_dict 파일에서 로드
+            state_path = tinfo.get("state_path")
+            enc = CharCNNEncoder()
+            if state_path and os.path.exists(state_path):
+                enc.load_state_dict(torch.load(state_path, map_location=DEVICE))
+            enc.to(DEVICE).eval()
+            bundle["char_encoder"] = enc
+        MODELS[task]  = bundle
+        DETAILS[task] = obj.get("details") or details
+        VERSIONS[task]= ver
     except Exception as e:
         print(f"[{task}] load warning:", e)
-    model.eval()
-    MODELS[task] = model
-    DETAILS[task] = details
-    VERSIONS[task] = ver
+        MODELS[task] = None; DETAILS[task] = None; VERSIONS[task] = None
 
-# --------------------- 학습 유틸 ---------------------
-CAT_COLS   = ["mccsno","block","event","sign","deptcode","shiptype"]
-NUM_COLS   = ["duration"]   # 필요 시 추가 가능
-
-def _gather_stats_and_vocabs(view_name: str):
-    conn = get_conn()
-    cats = {c:set() for c in CAT_COLS}
-    sums = {n:0.0 for n in NUM_COLS}
-    sums2= {n:0.0 for n in NUM_COLS}
-    cnts = {n:0   for n in NUM_COLS}
-    cur = conn.cursor(name=f"scan_{view_name}", withhold=True)
-    cur.itersize = 1000
-    cur.execute(f"SELECT item_name, spec_text, {', '.join(CAT_COLS+NUM_COLS)} FROM {S}.{view_name}")
-    while True:
-        rows = cur.fetchmany(2000)
-        if not rows: break
-        for (item_name, spec_text, *rest) in rows:
-            off = 0
-            for c in CAT_COLS:
-                v = rest[off]; off += 1
-                if v is not None and str(v).strip()!="":
-                    cats[c].add(str(v))
-            for n in NUM_COLS:
-                v = rest[off - (len(CAT_COLS) - CAT_COLS.index(n) - 1)] if False else None
-            # 위 한 줄은 사용 안 하므로 제거
-            # num은 아래에서 별도로 다시 읽자
-        # 숫자 피처만 다시 커서로 읽어 평균/분산
-    cur.close()
-
-    # 숫자 컬럼 통계
-    cur2 = conn.cursor(name=f"scan_num_{view_name}", withhold=True)
-    cur2.itersize = 1000
-    cur2.execute(f"SELECT {', '.join(NUM_COLS)} FROM {S}.{view_name}")
-    while True:
-        rows = cur2.fetchmany(5000)
-        if not rows: break
-        for tup in rows:
-            for i, n in enumerate(NUM_COLS):
-                v = tup[i]
-                if v is None: continue
-                v = float(v)
-                sums[n]  += v
-                sums2[n] += v*v
-                cnts[n]  += 1
-    cur2.close(); conn.close()
-
-    cat_vocabs = {c:{v:i+1 for i,v in enumerate(sorted(cats[c]))} for c in CAT_COLS}  # 0=UNK
-    numeric_stats = {}
-    for n in NUM_COLS:
-        if cnts[n] == 0:
-            numeric_stats[n] = {"mean":0.0,"std":1.0}
-        else:
-            mean = sums[n]/cnts[n]
-            var  = max(1e-8, sums2[n]/cnts[n] - mean*mean)
-            numeric_stats[n] = {"mean":mean,"std":math.sqrt(var)}
-    cat_cardinalities = {c:(len(cat_vocabs[c])+1) for c in CAT_COLS}  # +1 for UNK(0)
-    cat_emb_dims = {c:auto_cat_dim(cat_cardinalities[c]) for c in CAT_COLS}
-    return cat_vocabs, numeric_stats, cat_cardinalities, cat_emb_dims
-
-def _encode_features_row(r, details):
-    # 텍스트
-    text = " ".join([(r.get("item_name") or ""), (r.get("spec_text") or "")]).strip()
-    text_ids = encode_text_to_tensor(text, MAX_ITEM_LEN, DEVICE)
-
-    # 카테고리
-    cat_idxs = {}
-    vocabs = details["cat_vocabs"]
-    for c in CAT_COLS:
-        raw = r.get(c)
-        idx = vocabs[c].get(str(raw), 0) if (raw is not None and str(raw).strip()!="") else 0
-        cat_idxs[c] = torch.tensor(idx, dtype=torch.long, device=DEVICE)
-
-    # 수치
-    num_list = []
-    stats = details["numeric_stats"]
-    for n in NUM_COLS:
-        v = r.get(n, None)
-        if v is None:
-            val = 0.0
-        else:
-            m, s = stats[n]["mean"], stats[n]["std"]
-            val = (float(v)-m)/(s+1e-6)
-        num_list.append(val)
-    num_feats = torch.tensor(num_list, dtype=torch.float32, device=DEVICE)
-    return text_ids, cat_idxs, num_feats
-
-# --------------------- 학습 (item_act / item_mr) ---------------------
-def train_items(task: str):
-    """
-    task='item_act' → vw_training_item_act에서 (actocode:actno)
-    task='item_mr'  → vw_training_item_mr  에서 (mr_label)
-    """
-    assert task in ("item_act","item_mr")
-    set_global_seed(int(os.getenv("GLOBAL_SEED","0")) or None)
-
-    EPOCHS      = int(os.getenv("EPOCHS","3"))
-    LR          = float(os.getenv("LEARNING_RATE","0.001"))
-    ACC_STEPS   = int(os.getenv("ACCUM_STEPS","4"))
-    CLIP_NORM   = float(os.getenv("CLIP_NORM","0"))
-    view        = "vw_training_item_act" if task=="item_act" else "vw_training_item_mr"
-
+# --------------------- 데이터 적재 ---------------------
+def _fetch_training_rows(task: str) -> List[Dict]:
+    assert task in ("item_act", "item_mr")
+    view = "vw_training_item_act" if task == "item_act" else "vw_training_item_mr"
     conn = get_conn(); cur = dict_cur(conn)
-
-    # 라벨 스페이스
     if task == "item_act":
-        # 활성 코드를 라벨로
-        cur.execute(f"SELECT actocode, actno FROM {S}.activity_codes WHERE active=TRUE ORDER BY actocode, actno")
-        labs = [f"{r['actocode']}:{r['actno']}" for r in cur.fetchall()]
+        cur.execute(f"""
+            SELECT item_name, spec_text,
+                   mccsno, block, event, sign, duration, deptcode, shiptype,
+                   actocode, actno
+            FROM {S}.{view}
+        """)
     else:
-        cur.execute(f"SELECT DISTINCT mr_label FROM {S}.vw_training_item_mr ORDER BY mr_label")
-        labs = [r["mr_label"] for r in cur.fetchall() if (r["mr_label"] or "").strip()]
-    if not labs:
-        raise RuntimeError("No labels to train.")
-    key_to_idx = {k:i for i,k in enumerate(labs)}
+        cur.execute(f"""
+            SELECT item_name, spec_text,
+                   mccsno, block, event, sign, duration, deptcode, shiptype,
+                   mr_label
+            FROM {S}.{view}
+        """)
+    rows = cur.fetchall(); cur.close(); conn.close()
+    return rows
 
-    # 버전 생성
+def _build_frame_and_labels(task: str, rows: List[Dict]) -> Tuple[pd.DataFrame, List[str]]:
+    texts, mccsno, block, event, sign, duration, deptcode, shiptype, labels = [], [], [], [], [], [], [], [], []
+    for r in rows:
+        text = " ".join([(r.get("item_name") or ""), (r.get("spec_text") or "")]).strip()
+        texts.append(text)
+        mccsno.append((r.get("mccsno") or "").strip() or "UNK")
+        block.append((r.get("block") or "").strip() or "UNK")
+        event.append((r.get("event") or "").strip() or "UNK")
+        sign.append((r.get("sign") or "").strip() or "UNK")
+        deptcode.append((r.get("deptcode") or "").strip() or "UNK")
+        shiptype.append((r.get("shiptype") or "").strip() or "UNK")
+        v = r.get("duration", None)
+        duration.append(0 if v is None else float(v))
+
+        if task == "item_act":
+            lab = f"{r.get('actocode')}:{r.get('actno')}"
+        else:
+            lab = r.get("mr_label")
+        if not (lab and str(lab).strip()):
+            continue
+        labels.append(str(lab))
+
+    df = pd.DataFrame({
+        "text": texts,
+        "mccsno": mccsno,
+        "block": block,
+        "event": event,
+        "sign": sign,
+        "deptcode": deptcode,
+        "shiptype": shiptype,
+        "duration": duration
+    })
+    return df, labels
+
+# --------------------- 전처리 구성 ---------------------
+def _pre_catnum():
+    # sklearn 1.4+와 1.3- 모두 호환
+    try:
+        cat_enc = OneHotEncoder(handle_unknown="ignore", dtype=np.float32, sparse_output=True)
+    except TypeError:
+        cat_enc = OneHotEncoder(handle_unknown="ignore", dtype=np.float32, sparse=True)
+    num_scaler = StandardScaler(with_mean=False)
+    pre = ColumnTransformer(
+        transformers=[
+            ("cat",  cat_enc,  CAT_COLS),
+            ("num",  num_scaler, NUM_COLS),
+        ],
+        sparse_threshold=0.1
+    )
+    return pre
+
+def _pre_hash():
+    text_vec = HashingVectorizer(
+        n_features=HASH_N_FEATURES,
+        analyzer="char",
+        ngram_range=(HASH_NGRAM_MIN, HASH_NGRAM_MAX),
+        alternate_sign=False,
+        norm=None,
+        dtype=np.float32,
+        preprocessor=normalize_text
+    )
+    try:
+        cat_enc = OneHotEncoder(handle_unknown="ignore", dtype=np.float32, sparse_output=True)
+    except TypeError:
+        cat_enc = OneHotEncoder(handle_unknown="ignore", dtype=np.float32, sparse=True)
+    num_scaler = StandardScaler(with_mean=False)
+    pre = ColumnTransformer(
+        transformers=[
+            ("text", text_vec, "text"),
+            ("cat",  cat_enc,  CAT_COLS),
+            ("num",  num_scaler, NUM_COLS),
+        ],
+        sparse_threshold=0.1
+    )
+    return pre, text_vec
+
+# --------------------- 학습 ---------------------
+def train_items(task: str) -> Tuple[int, int]:
+    assert task in ("item_act", "item_mr")
+
+    # (A) 라벨 공간
+    conn = get_conn(); cur = dict_cur(conn)
+    if task == "item_act":
+        cur.execute(f"SELECT actocode, actno FROM {S}.activity_codes WHERE active=TRUE ORDER BY actocode, actno")
+        labs_master = [f"{r['actocode']}:{r['actno']}" for r in cur.fetchall()]
+    else:
+        cur.execute(f"SELECT DISTINCT mr_label FROM {S}.vw_training_item_mr WHERE mr_label IS NOT NULL ORDER BY mr_label")
+        labs_master = [r["mr_label"] for r in cur.fetchall()]
+    cur.close(); conn.close()
+    if not labs_master:
+        raise RuntimeError("No labels to train (master empty).")
+
+    # (B) 버전 먼저 발급 (charcnn state 파일명에 사용)
+    conn = get_conn(); cur = dict_cur(conn)
     cur.execute(f"INSERT INTO {S}.model_versions(details) VALUES ('{{}}') RETURNING version_id")
-    ver = cur.fetchone()["version_id"]; conn.commit()
+    ver = cur.fetchone()["version_id"]; conn.commit(); cur.close(); conn.close()
 
-    # 카테고리/수치 통계 & 보카브
-    cat_vocabs, numeric_stats, cat_card, cat_emb_dims = _gather_stats_and_vocabs(view)
+    # (C) 데이터 적재
+    rows = _fetch_training_rows(task)
+    if not rows:
+        raise RuntimeError("No training rows.")
+    df, labels = _build_frame_and_labels(task, rows)
 
-    # 모델 구성
-    model = HybridItemClassifier(num_classes=len(labs), cat_cardinalities=cat_card,
-                                 cat_emb_dims=cat_emb_dims, num_numeric=len(NUM_COLS)).to(DEVICE)
-    model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-    loss_fn = nn.CrossEntropyLoss()
+    # (D) 라벨 인코딩(마스터 기준 고정)
+    le = LabelEncoder()
+    le.fit(labs_master)
+    y = le.transform([lab if lab in labs_master else labs_master[0] for lab in labels])
 
-    # 스트리밍 학습
-    stream = conn.cursor(name=f"{task}_train", withhold=True)
-    stream.itersize = 1000
-    cols = "item_name,spec_text," + ",".join(CAT_COLS+NUM_COLS)
-    label_col = "actocode,actno" if task=="item_act" else "mr_label"
-    stream.execute(f"SELECT {cols}, {label_col} FROM {S}.{view} ORDER BY pjtno,porser,porseq,revno,line_no")
-    step = 0
-    while True:
-        rows = stream.fetchmany(1000)
-        if not rows: break
-        for tup in rows:
-            # dict 로 재구성
-            d = {}
-            i = 0
-            d["item_name"] = tup[i]; i+=1
-            d["spec_text"] = tup[i]; i+=1
-            for c in CAT_COLS+NUM_COLS:
-                d[c] = tup[i]; i+=1
-            if task=="item_act":
-                actocode = tup[i]; actno = tup[i+1]
-                ykey = f"{actocode}:{actno}"
+    # (E) 텍스트 인코딩 + cat/num 전처리
+    bundle: Dict = {}
+    if TEXT_ENCODER == "charcnn":
+        # Char-CNN 학습(MPS), 임베딩 추출
+        enc, tinfo = _train_charcnn(df["text"].tolist(), y, num_classes=len(labs_master))
+        # 임베딩 전체 계산
+        text_emb = _encode_charcnn(df["text"].tolist(), enc, CHARCNN_MAX_LEN, CHARCNN_BS)  # (N, D)
+        pre = _pre_catnum()
+        catnum = pre.fit_transform(df)                                         # (N, S)
+        X = sparse.hstack([sparse.csr_matrix(text_emb), catnum], format="csr") # (N, D+S)
+        # 인코더 state 저장
+        state_path = f"./models/{task}_v{ver}_charcnn.pt"
+        torch.save(enc.state_dict(), state_path)
+        tinfo["state_path"] = state_path
+        bundle["char_encoder"] = enc  # 메모리 내 보관(서버 재시작 시 details로부터 로드)
+    else:
+        # 폴백: 문자 n-gram 해싱(완전 CPU)
+        pre, _ = _pre_hash()
+        X = pre.fit_transform(df)
+        tinfo = {
+            "type": "hash",
+            "hash_features": HASH_N_FEATURES,
+            "char_ngram": [HASH_NGRAM_MIN, HASH_NGRAM_MAX],
+        }
+
+    # (F) 학습/검증 분할
+    val_split = float(os.getenv("XGB_VALID_SPLIT", "0.1"))
+    early_rounds = int(os.getenv("XGB_EARLY_STOPPING_ROUNDS", "50"))
+    use_valid = (val_split > 0.0) and (len(np.unique(y)) > 1) and (X.shape[0] >= 50)
+
+    if use_valid:
+        Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=val_split, stratify=y, random_state=42)
+    else:
+        Xtr, ytr = X, y
+        Xva, yva = None, None
+
+    # (G) XGBoost 학습
+    clf = _build_classifier(num_class=len(labs_master))
+    tree_used = clf.get_xgb_params().get("tree_method")
+    pred_used = clf.get_xgb_params().get("predictor")
+
+    try:
+        if use_valid:
+            clf.fit(Xtr, ytr, eval_set=[(Xva, yva)], verbose=False, early_stopping_rounds=early_rounds)
+        else:
+            clf.fit(Xtr, ytr, verbose=False)
+    except Exception as e:
+        # GPU 빌드/드라이버 문제로 실패 시 자동 폴백
+        # (예: Windows에서 xgboost가 GPU 미지원 빌드인 경우)
+        if str(tree_used).startswith("gpu"):
+            # CPU로 재시도
+            clf = _build_classifier(num_class=len(labs_master), force_method="hist", force_predictor="auto")
+            if use_valid:
+                clf.fit(Xtr, ytr, eval_set=[(Xva, yva)], verbose=False, early_stopping_rounds=early_rounds)
             else:
-                ykey = tup[i]
-            if ykey not in key_to_idx:
-                continue
-            y = torch.tensor([key_to_idx[ykey]], dtype=torch.long, device=DEVICE)
+                clf.fit(Xtr, ytr, verbose=False)
+            tree_used = "hist";
+            pred_used = "auto"
+        else:
+            raise
 
-            details = {
-                "cat_vocabs": cat_vocabs,
-                "numeric_stats": numeric_stats,
-                "cat_cardinalities": cat_card,
-                "cat_emb_dims": cat_emb_dims,
-                "label_keys": labs
-            }
-            text_ids, cat_idxs, num_feats = _encode_features_row(d, details)
-            logits = model(text_ids, cat_idxs, num_feats)      # (C,)
-            loss = loss_fn(logits.unsqueeze(0), y)             # add batch dim
-            (loss / ACC_STEPS).backward()
-            step += 1
-            if step % ACC_STEPS == 0:
-                if CLIP_NORM > 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
-                opt.step(); opt.zero_grad()
-    stream.close()
-
-    if step % ACC_STEPS != 0:
-        if CLIP_NORM > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
-        opt.step(); opt.zero_grad()
-
-    # 저장
+    # (H) 저장/등록
     details = {
         "task": task,
-        "label_keys": labs,
-        "cat_vocabs": cat_vocabs,
-        "numeric_stats": numeric_stats,
-        "cat_cardinalities": cat_card,
-        "cat_emb_dims": cat_emb_dims,
-        "charset": CHARSET,
-        "text_cnn": {"emb_dim": EMB_DIM, "out_ch": OUT_CH, "kernels": list(KERNELS)},
-        "mlp_hidden": MLP_HIDDEN,
-        "dropout": DROPOUT,
+        "label_keys": labs_master,
+        "cat_cols": CAT_COLS,
         "num_cols": NUM_COLS,
-        "cat_cols": CAT_COLS
+        "text_encoder": tinfo,
+        "xgb": {
+            "n_estimators": int(os.getenv("XGB_N_ESTIMATORS", "800")),
+            "learning_rate": float(os.getenv("XGB_LEARNING_RATE", "0.05")),
+            "max_depth": int(os.getenv("XGB_MAX_DEPTH", "8")),
+            "subsample": float(os.getenv("XGB_SUBSAMPLE", "0.9")),
+            "colsample_bytree": float(os.getenv("XGB_COLSAMPLE_BYTREE", "0.9")),
+            "tree_method": os.getenv("XGB_TREE_METHOD", "auto"),
+            "predictor": os.getenv("XGB_PREDICTOR", "auto"),
+            "tree_method_used": tree_used,
+            "predictor_used": pred_used
+        }
     }
-    _save_model(ver, task, model, details)
-    model.eval()
+    bundle.update({"preprocessor": pre, "clf": clf, "label_encoder": le})
+    _save_model(ver, task, bundle, details)
 
-    # 메타 업데이트
-    cur = dict_cur(conn)
+    # 메타 갱신 및 전역 로드
+    conn = get_conn(); cur = dict_cur(conn)
     cur.execute(f"UPDATE {S}.model_versions SET trained_at=NOW() WHERE version_id=%s", (ver,))
     conn.commit(); cur.close(); conn.close()
 
-    # 전역 로드
     load_latest(task)
-    return ver, len(labs)
+    return ver, len(labs_master)
 
 # --------------------- 예측 ---------------------
-def predict_items(task: str, header_rows: list[dict], topk: int=3):
+def _rows_to_frame(rows: List[Dict]) -> pd.DataFrame:
+    texts, mccsno, block, event, sign, duration, deptcode, shiptype = [], [], [], [], [], [], [], []
+    for r in rows:
+        texts.append((" ".join([(r.get("item_name") or ""), (r.get("spec_text") or "")]).strip()))
+        mccsno.append((r.get("mccsno") or "").strip() or "UNK")
+        block.append((r.get("block") or "").strip() or "UNK")
+        event.append((r.get("event") or "").strip() or "UNK")
+        sign.append((r.get("sign") or "").strip() or "UNK")
+        deptcode.append((r.get("deptcode") or "").strip() or "UNK")
+        shiptype.append((r.get("shiptype") or "").strip() or "UNK")
+        v = r.get("duration", None)
+        duration.append(0 if v is None else float(v))
+
+    return pd.DataFrame({
+        "text": texts,
+        "mccsno": mccsno,
+        "block": block,
+        "event": event,
+        "sign": sign,
+        "deptcode": deptcode,
+        "shiptype": shiptype,
+        "duration": duration
+    })
+
+def predict_items(task: str, header_rows: List[Dict], topk: int = 3):
     if MODELS[task] is None or DETAILS[task] is None:
         raise RuntimeError(f"{task} model not loaded.")
-    model = MODELS[task]; details = DETAILS[task]
-    labs  = details["label_keys"]
+    bundle = MODELS[task]
+    pre = bundle["preprocessor"]; clf = bundle["clf"]; le = bundle["label_encoder"]
+    label_keys = list(le.classes_)
+    details = DETAILS[task]; tinfo = details.get("text_encoder", {"type":"hash"})
+
+    df = _rows_to_frame(header_rows)
+
+    if tinfo.get("type") == "charcnn":
+        enc: CharCNNEncoder = bundle.get("char_encoder")
+        if enc is None:
+            # 안전장치: 서버가 재시작되어 메모리 캐시가 없다면 파일에서 로딩
+            enc = CharCNNEncoder()
+            state_path = tinfo.get("state_path")
+            if state_path and os.path.exists(state_path):
+                enc.load_state_dict(torch.load(state_path, map_location=DEVICE))
+            enc.to(DEVICE).eval()
+            bundle["char_encoder"] = enc
+
+        emb = _encode_charcnn(df["text"].tolist(), enc, tinfo.get("max_len", CHARCNN_MAX_LEN), CHARCNN_BS)
+        catnum = pre.transform(df)
+        X = sparse.hstack([sparse.csr_matrix(emb), catnum], format="csr")
+    else:
+        # hash 경로: ColumnTransformer가 text 포함
+        X = pre.transform(df)
+
+    proba = clf.predict_proba(X)
     out = []
-    with torch.no_grad():
-        for r in header_rows:
-            text_ids, cat_idxs, num_feats = _encode_features_row(r, details)
-            logits = model(text_ids, cat_idxs, num_feats)
-            probs  = torch.softmax(logits, dim=0).cpu().numpy()
-            idx = int(np.argmax(probs))
-            label = labs[idx]
-            order = np.argsort(-probs)[:topk]
-            top = [{"label": labs[i], "score": float(probs[i])} for i in order]
-            out.append((label, float(probs[idx]), top))
+    if proba.ndim == 1 or proba.shape[1] == 1:
+        p1 = proba.ravel(); p0 = 1.0 - p1
+        probs = np.vstack([p0, p1]).T
+    else:
+        probs = proba
+
+    for i in range(probs.shape[0]):
+        vec = probs[i]
+        idx = int(np.argmax(vec))
+        label = label_keys[idx]
+        order = np.argsort(-vec)[:min(topk, len(label_keys))]
+        top = [{"label": label_keys[j], "score": float(vec[j])} for j in order]
+        out.append((label, float(vec[idx]), top))
     return out, VERSIONS[task]
+
+# --- add this helper near _build_classifier ---
+def _choose_xgb_tree_and_predictor():
+    """XGBoost 트리/프리딕터 자동 결정: cuda 가능하면 gpu_hist, 아니면 hist"""
+    pref_method = os.getenv("XGB_TREE_METHOD", "auto").lower()
+    pref_pred   = os.getenv("XGB_PREDICTOR", "auto").lower()
+
+    if pref_method != "auto":
+        method = pref_method
+    else:
+        # torch.cuda로 간단히 감지 (없으면 CPU)
+        method = "gpu_hist" if (torch.cuda.is_available()) else "hist"
+
+    if pref_pred != "auto":
+        predictor = pref_pred
+    else:
+        predictor = "gpu_predictor" if method == "gpu_hist" else "auto"
+    return method, predictor

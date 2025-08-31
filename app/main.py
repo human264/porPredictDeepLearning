@@ -1,3 +1,4 @@
+# app/main.py
 import logging
 
 from dotenv import load_dotenv
@@ -12,7 +13,7 @@ from app.schemas import PredictItemReq, TrainResp, ItemPredictResp
 load_dotenv()
 
 logger = logging.getLogger("por-ml")
-app = FastAPI(title="POR Item Classifier (Hybrid)")
+app = FastAPI(title="POR Item Classifier (XGBoost-only)")
 S = get_schema()
 
 # ✅ /ml/* 엔드포인트 추가 (XGBoost 파이프라인)
