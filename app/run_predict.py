@@ -1,4 +1,5 @@
-# run_predict.py
+# app/run_predict.py
+
 """
 헤더별 예측 트리거 스크립트
 - POST /ml/mr/predict_header

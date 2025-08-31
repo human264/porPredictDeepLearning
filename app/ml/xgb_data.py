@@ -1,3 +1,4 @@
+# app/ml/xgb_data.py
 from typing import Tuple, Dict, Any
 import pandas as pd
 
@@ -13,6 +14,7 @@ def fetch_training_df(target: str) -> pd.DataFrame:
     """
     target: 'mr' or 'act'
     헤더 단위 대표 라벨을 1개로 축약 후 tb_por_detail 라인과 조인하여 학습셋 구성.
+    (Oracle 11g 호환)
     """
     conn = get_conn(); cur = dict_cur(conn)
     try:
@@ -26,9 +28,10 @@ def fetch_training_df(target: str) -> pd.DataFrame:
           SELECT
               pjtno, porser, porseq, revno,
               MIN(
-                CASE WHEN actocode IS NOT NULL AND actno IS NOT NULL
-                     THEN actocode || ':' || actno::text
-                     ELSE NULL
+                CASE
+                  WHEN actocode IS NOT NULL AND actno IS NOT NULL
+                    THEN actocode || ':' || TO_CHAR(actno)
+                  ELSE NULL
                 END
               ) AS act_label
           FROM {S}.tb_mr
@@ -40,8 +43,10 @@ def fetch_training_df(target: str) -> pd.DataFrame:
           mr.mrno AS {TARGET_MR},
           act.act_label AS {TARGET_ACT}
         FROM {S}.tb_por_detail d
-        LEFT JOIN mr_agg  mr  USING (pjtno, porser, porseq, revno)
-        LEFT JOIN act_agg act USING (pjtno, porser, porseq, revno)
+        LEFT JOIN mr_agg  mr
+          ON (d.pjtno=mr.pjtno AND d.porser=mr.porser AND d.porseq=mr.porseq AND d.revno=mr.revno)
+        LEFT JOIN act_agg act
+          ON (d.pjtno=act.pjtno AND d.porser=act.porser AND d.porseq=act.porseq AND d.revno=act.revno)
         """
         cur.execute(sql)
         rows = cur.fetchall()
@@ -64,18 +69,24 @@ def fetch_training_df(target: str) -> pd.DataFrame:
 
     return df
 
+
 def fetch_predict_df(header: Dict[str, Any]) -> pd.DataFrame:
-    """지정한 헤더의 tb_por_detail 라인들을 로드하여 예측 입력으로 반환"""
+    """지정한 헤더의 tb_por_detail 라인들을 로드하여 예측 입력으로 반환 (Oracle 바인딩 사용)"""
     conn = get_conn(); cur = dict_cur(conn)
     try:
         sql = f"""
         SELECT line_no, pjtno, porser, porseq, revno,
                mccsno, block, event, sign, duration, deptcode, shiptype
         FROM {S}.tb_por_detail
-        WHERE pjtno=%s AND porser=%s AND porseq=%s AND revno=%s
+        WHERE pjtno=:pjtno AND porser=:porser AND porseq=:porseq AND revno=:revno
         ORDER BY line_no
         """
-        cur.execute(sql, (header["pjtno"], header["porser"], header["porseq"], header["revno"]))
+        cur.execute(sql, {
+            "pjtno": header["pjtno"],
+            "porser": header["porser"],
+            "porseq": header["porseq"],
+            "revno": header["revno"],
+        })
         rows = cur.fetchall()
         df = pd.DataFrame(rows)
     finally:

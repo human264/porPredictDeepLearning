@@ -1,4 +1,4 @@
-# run_train.py
+# app/run_train.py
 """
 FastAPI 학습 엔드포인트 트리거 스크립트.
 - 기본 호출 대상:

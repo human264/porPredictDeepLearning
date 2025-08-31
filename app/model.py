@@ -1,3 +1,4 @@
+# app/model.py
 import os, json
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -192,29 +193,44 @@ def _train_charcnn(texts: List[str], y: np.ndarray, num_classes: int) -> Tuple[C
 
 # --------------------- 저장/로드 ---------------------
 def _save_model(ver: int, task: str, bundle: Dict[str, Any], details: Dict[str, Any]) -> str:
+    import json
     os.makedirs("models", exist_ok=True)
     path = f"./models/{task}_v{ver}.joblib"
     joblib.dump({"bundle": bundle, "details": details}, path)
-    conn = get_conn(); cur = dict_cur(conn)
+
+    conn = get_conn(); cur = conn.cursor()
     det = dict(details); det["task"] = task
-    cur.execute(f"UPDATE {S}.model_versions SET details=%s WHERE version_id=%s", (json.dumps(det), ver))
+    cur.execute(
+        f"UPDATE {S}.model_versions SET details=:1 WHERE version_id=:2",
+        (json.dumps(det, ensure_ascii=False), ver)
+    )
     conn.commit(); cur.close(); conn.close()
     return path
 
+
 def load_latest(task: str) -> None:
+    import json
     conn = get_conn(); cur = dict_cur(conn)
+    # details에 '"task":"{task}"' 문자열이 들어있다는 가정 (11g JSON 함수 부재)
     cur.execute(f"""
-      SELECT version_id, details
-      FROM {S}.model_versions
-      WHERE COALESCE(details->>'task','')=%s
-      ORDER BY version_id DESC
-      LIMIT 10
-    """, (task,))
+      SELECT version_id, details FROM (
+        SELECT version_id, details
+        FROM {S}.model_versions
+        WHERE details LIKE :task_like
+        ORDER BY version_id DESC
+      )
+      WHERE ROWNUM <= 10
+    """, {"task_like": f'%\"task\":\"{task}\"%'})
     rows = cur.fetchall(); cur.close(); conn.close()
 
     chosen = None
     for r in rows:
-        ver = r["version_id"]; det = r["details"] or {}
+        ver = r["version_id"]
+        det_raw = r.get("details")
+        try:
+            det = json.loads(det_raw) if det_raw else {}
+        except Exception:
+            det = {}
         path = f"./models/{task}_v{ver}.joblib"
         if os.path.exists(path):
             chosen = (ver, det, path); break
@@ -241,6 +257,7 @@ def load_latest(task: str) -> None:
     except Exception as e:
         print(f"[{task}] load warning:", e)
         MODELS[task] = None; DETAILS[task] = None; VERSIONS[task] = None
+
 
 # --------------------- 데이터 적재 ---------------------
 def _fetch_training_rows(task: str) -> List[Dict[str, Any]]:
@@ -324,42 +341,65 @@ def _pre_hash() -> Tuple[ColumnTransformer, HashingVectorizer]:
     return pre, text_vec
 
 # --------------------- 학습 ---------------------
+def _alloc_new_version_id(conn) -> int:
+    """
+    Oracle 11g: 시퀀스가 있으면 사용, 없으면 MAX+1 폴백
+    환경변수 MODEL_VERSION_SEQ (예: MODEL_VERSIONS_SEQ) 지원
+    """
+    seq = os.getenv("MODEL_VERSION_SEQ", f"{S}.MODEL_VERSIONS_SEQ")
+    cur = conn.cursor()
+    try:
+        cur.execute(f"SELECT {seq}.NEXTVAL FROM dual")
+        ver = cur.fetchone()[0]
+    except Exception:
+        cur.execute(f"SELECT NVL(MAX(version_id),0)+1 FROM {S}.model_versions")
+        ver = cur.fetchone()[0]
+    cur.close()
+    return int(ver)
+
+
 def train_items(task: str) -> Tuple[int, int]:
     assert task in ("item_act", "item_mr")
 
-    # 라벨 공간
+    # 라벨 공간 (활성 조건은 환경/스키마에 맞게 조정)
     conn = get_conn(); cur = dict_cur(conn)
-
     if task == "item_act":
-        cur.execute(f"SELECT actocode, actno FROM {S}.activity_codes WHERE active=TRUE ORDER BY actocode, actno")
+        # Postgres의 active=TRUE → Oracle에서는 숫자/문자 플래그를 쓰는 경우가 많음
+        # 필요 시 NVL(active,1)=1 → 'Y'/'N'이면 NVL(active,'Y')='Y'로 바꾸세요.
+        cur.execute(f"SELECT actocode, actno FROM {S}.activity_codes WHERE NVL(active,1)=1 ORDER BY actocode, actno")
         labs_master = [f"{r['actocode']}:{r['actno']}" for r in cur.fetchall()]
     else:
-        cur.execute(f"SELECT DISTINCT mr_label FROM {S}.vw_training_item_mr WHERE mr_label IS NOT NULL ORDER BY mr_label")
+        cur.execute(f"""
+            SELECT DISTINCT mr_label
+            FROM {S}.vw_training_item_mr
+            WHERE mr_label IS NOT NULL
+            ORDER BY mr_label
+        """)
         labs_master = [r["mr_label"] for r in cur.fetchall()]
     cur.close(); conn.close()
     if not labs_master:
         raise RuntimeError("No labels to train (master empty).")
 
-    # 버전 발급 (Char-CNN state 파일명 사용)
-    conn = get_conn(); cur = dict_cur(conn)
-    cur.execute(f"INSERT INTO {S}.model_versions(details) VALUES ('{{}}') RETURNING version_id")
-    ver = cur.fetchone()["version_id"]; conn.commit(); cur.close(); conn.close()
+    # 버전 발급 & 빈 row 삽입 (RETURNING 대체)
+    conn = get_conn()
+    ver = _alloc_new_version_id(conn)
+    c0 = conn.cursor()
+    c0.execute(f"INSERT INTO {S}.model_versions (version_id, details) VALUES (:1, :2)", (ver, "{}"))
+    conn.commit(); c0.close(); conn.close()
 
-    # 데이터
+    # ----- 이하 원본 로직 동일 (데이터 적재/학습/저장) -----
     rows = _fetch_training_rows(task)
     if not rows:
         raise RuntimeError("No training rows.")
     df, labels = _build_frame_and_labels(task, rows)
 
-    # 라벨 인코딩(마스터 기준 고정)
     le = LabelEncoder(); le.fit(labs_master)
     y = le.transform([lab if lab in labs_master else labs_master[0] for lab in labels])
 
-    # 텍스트 인코딩 + cat/num 전처리
     bundle: Dict[str, Any] = {}
     if TEXT_ENCODER == "charcnn":
         enc, tinfo = _train_charcnn(df["text"].tolist(), y, num_classes=len(labs_master))
-        text_emb = _encode_charcnn(df["text"].tolist(), enc, CHARCNN_MAX_LEN, CHARCNN_BS)  # (N, D)
+        text_emb = _encode_charcnn(df["text"].tolist(), enc, CHARCNN_MAX_LEN, CHARCNN_BS)
         pre = _pre_catnum()
         catnum = pre.fit_transform(df)
         X = sparse.hstack([sparse.csr_matrix(text_emb), catnum], format="csr")
@@ -372,7 +412,6 @@ def train_items(task: str) -> Tuple[int, int]:
         X = pre.fit_transform(df)
         tinfo = {"type": "hash", "hash_features": HASH_N_FEATURES, "char_ngram": [HASH_NGRAM_MIN, HASH_NGRAM_MAX]}
 
-    # 검증 분할
     val_split = float(os.getenv("XGB_VALID_SPLIT", "0.1"))
     early_rounds = int(os.getenv("XGB_EARLY_STOPPING_ROUNDS", "50"))
     use_valid = (val_split > 0.0) and (len(np.unique(y)) > 1) and (X.shape[0] >= 50)
@@ -382,7 +421,6 @@ def train_items(task: str) -> Tuple[int, int]:
         Xtr, ytr = X, y
         Xva, yva = None, None
 
-    # XGBoost 학습(+GPU 폴백)
     clf = _build_classifier(num_class=len(labs_master))
     tree_used = clf.get_xgb_params().get("tree_method")
     pred_used = clf.get_xgb_params().get("predictor")
@@ -402,7 +440,6 @@ def train_items(task: str) -> Tuple[int, int]:
         else:
             raise
 
-    # 저장/등록
     details = {
         "task": task,
         "label_keys": labs_master,
@@ -423,14 +460,13 @@ def train_items(task: str) -> Tuple[int, int]:
     bundle.update({"preprocessor": pre, "clf": clf, "label_encoder": le})
     _save_model(ver, task, bundle, details)
 
-    # 메타 갱신 및 전역 로드
-    conn = get_conn(); cur = dict_cur(conn)
-    cur.execute(f"UPDATE {S}.model_versions SET trained_at=NOW() WHERE version_id=%s", (ver,))
+    # 학습 시간 갱신: NOW() → SYSDATE
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(f"UPDATE {S}.model_versions SET trained_at=SYSDATE WHERE version_id=:1", (ver,))
     conn.commit(); cur.close(); conn.close()
 
     load_latest(task)
     return ver, len(labs_master)
-
 # --------------------- 예측 ---------------------
 def _rows_to_frame(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     texts, mccsno, block, event, sign, duration, deptcode, shiptype = [], [], [], [], [], [], [], []
