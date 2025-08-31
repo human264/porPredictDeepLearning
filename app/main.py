@@ -49,22 +49,22 @@ def _startup():
 
 @app.get("/debug/dbinfo")
 def debug_dbinfo():
-    conn = get_conn();
+    conn = get_conn()
     cur = dict_cur(conn)
     try:
-        cur.execute("SELECT current_user, session_user");
+        cur.execute("SELECT current_user, session_user")
         u = cur.fetchone()
-        cur.execute("SELECT current_database() AS db, inet_server_addr()::text AS host, inet_server_port() AS port");
+        cur.execute("SELECT current_database() AS db, inet_server_addr()::text AS host, inet_server_port() AS port")
         d = cur.fetchone()
-        cur.execute("SHOW search_path");
+        cur.execute("SHOW search_path")
         sp = cur.fetchone()
-        cur.execute("SELECT version() AS ver");
+        cur.execute("SELECT version() AS ver")
         ver = cur.fetchone()
-        cur.execute("SELECT extname FROM pg_catalog.pg_extension ORDER BY 1");
+        cur.execute("SELECT extname FROM pg_catalog.pg_extension ORDER BY 1")
         exts = [r["extname"] for r in cur.fetchall()]
         return {"user": u, "db": d, "search_path": sp, "version": ver, "extensions": exts, "schema": S}
     finally:
-        cur.close();
+        cur.close()
         conn.close()
 
 
@@ -134,16 +134,17 @@ def train():
 def rebuild_sets():
     from app.textvec import normalize, text_to_vec
     V = int(os.getenv("VEC_DIM", "512"))
-    inserted = 0;
+    inserted = 0
     updated = 0
-    conn = get_conn();
+    conn = get_conn()
     cur = dict_cur(conn)
     try:
         # 학습 뷰에서 헤더/활동별 items 가져와 set_embed 생성
         cur.execute(f"SELECT pjtno,porser,porseq,revno,actocode,actno,items FROM {S}.vw_training_activity")
         rows = cur.fetchall()
         with conn:
-            with conn.cursor() as c:
+            # ✅ dict cursor 사용 (ex["id"] 접근 가능)
+            with dict_cur(conn) as c:
                 for r in rows:
                     items = [normalize((t or "")) for t in (r["items"] or []) if (t or "").strip()]
                     if not items:
@@ -176,7 +177,7 @@ def rebuild_sets():
                         inserted += 1
         return {"status": "ok", "inserted": inserted, "updated": updated}
     finally:
-        cur.close();
+        cur.close()
         conn.close()
 
 
@@ -185,7 +186,7 @@ def _apply_rule_if_any(full_text: str, header: dict):
     룰 매칭: pattern ~* full_text
     + where_* 가 NULL이거나, tb_por_detail에 동일 값/범위 존재
     """
-    conn = get_conn();
+    conn = get_conn()
     cur = dict_cur(conn)
     try:
         cur.execute(
@@ -229,7 +230,7 @@ def _apply_rule_if_any(full_text: str, header: dict):
         r = cur.fetchone()
         return (r["target_actocode"], r["target_actno"]) if r else None
     finally:
-        cur.close();
+        cur.close()
         conn.close()
 
 
@@ -249,7 +250,7 @@ def predict(req: PredictReq):
     if req.pjtno and req.porser and req.porseq and req.revno:
         header = {"pjtno": req.pjtno, "porser": req.porser, "porseq": req.porseq, "revno": req.revno}
         # POR 라인에서 아이템 구성
-        conn = get_conn();
+        conn = get_conn()
         cur = dict_cur(conn)
         try:
             cur.execute(
@@ -261,7 +262,7 @@ def predict(req: PredictReq):
             rows = cur.fetchall()
             items = [(" ".join([r["item_name"] or "", r["spec_text"] or ""])).strip() for r in rows]
         finally:
-            cur.close();
+            cur.close()
             conn.close()
     elif req.items:
         items = req.items
@@ -270,10 +271,12 @@ def predict(req: PredictReq):
 
     clean = [normalize(x) for x in items if (x or "").strip()]
     full_text = " ".join(clean)
+
     force_ensemble = FORCE_ENSEMBLE or bool(getattr(req, "force_ensemble", False))
+    model_only = bool(getattr(req, "model_only", False)) or (float(os.getenv("ENSEMBLE_ALPHA", "0.5")) >= 0.9999)
 
     # 2) 룰
-    if header and not force_ensemble:
+    if header and (not force_ensemble) and (not model_only):
         hit = _apply_rule_if_any(full_text, header)
         if hit:
             actocode, actno = hit
@@ -303,6 +306,18 @@ def predict(req: PredictReq):
         probs = torch.softmax(logits, dim=0).cpu().numpy()
     model_prob = {mdl.LABEL_KEYS[i]: float(probs[i]) for i in range(len(mdl.LABEL_KEYS))}
 
+    if model_only:
+        # 모델 점수만으로 Top3 계산
+        top = sorted(model_prob.items(), key=lambda x: x[1], reverse=True)
+        best_key, conf = top[0]
+        actocode, actno = best_key.split(":", 1)
+        top3 = [{"label": k, "score": _fmt_score(v)} for k, v in top[:3]]
+        conf_out = float(_fmt_score(conf))
+        _log_pred(header, actocode, actno, conf_out, Json(top3), via="model_only")
+        _upsert_proposed(header, actocode, actno, conf_out, Json(top3))
+        return {"actocode": actocode, "actno": actno, "confidence": conf_out,
+                "top3": top3, "model_version": mdl.CURRENT_MODEL_VERSION or 0}
+
     # 5) Ensemble
     labels = set(knn_prob.keys()) | set(model_prob.keys())
     scores = {lab: alpha * model_prob.get(lab, 0.0) + (1 - alpha) * knn_prob.get(lab, 0.0) for lab in labels}
@@ -329,7 +344,8 @@ def _log_pred(header, actocode, actno, conf: float, top3_json, via="ensemble", a
             with conn.cursor() as cur:
                 if header:
                     explain = {"via": via}
-                    if alpha is not None: explain["alpha"] = alpha
+                    if alpha is not None:
+                        explain["alpha"] = alpha
                     cur.execute(
                         f"""INSERT INTO {S}.bundle_predictions
                             (pjtno,porser,porseq,revno,predicted_actocode,predicted_actno,confidence,top3,model_version,explain)

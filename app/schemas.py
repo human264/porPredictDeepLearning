@@ -64,7 +64,7 @@ class PredictReq(BaseModel):
     items: Optional[List[Any]] = None
     # 옵션
     force_ensemble: Optional[bool] = False
-
+    model_only: bool | None = None  # 👈 추가: True면 모델만
     @field_validator("items", mode="before")
     @classmethod
     def coerce_items(cls, v):
