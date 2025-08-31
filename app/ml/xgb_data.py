@@ -1,4 +1,3 @@
-# app/ml/xgb_data.py
 from typing import Tuple, Dict, Any
 import pandas as pd
 
@@ -13,12 +12,10 @@ S = get_schema()
 def fetch_training_df(target: str) -> pd.DataFrame:
     """
     target: 'mr' or 'act'
-    헤더(pjtno, porser, porseq, revno) 단위로 대표 MR/ACT 라벨을 1개로 축약 후
-    tb_por_detail 라인과 조인하여 라인 단위 학습셋을 구성.
+    헤더 단위 대표 라벨을 1개로 축약 후 tb_por_detail 라인과 조인하여 학습셋 구성.
     """
     conn = get_conn(); cur = dict_cur(conn)
     try:
-        # 대표 라벨 축약(기본: MIN)
         sql = f"""
         WITH mr_agg AS (
           SELECT pjtno, porser, porseq, revno, MIN(mrno) AS mrno
@@ -28,12 +25,10 @@ def fetch_training_df(target: str) -> pd.DataFrame:
         act_agg AS (
           SELECT
               pjtno, porser, porseq, revno,
-              -- 둘 다 있을 때만 라벨 생성, 아니면 NULL
               MIN(
-                CASE
-                  WHEN actocode IS NOT NULL AND actno IS NOT NULL
-                    THEN actocode || ':' || actno::text
-                  ELSE NULL
+                CASE WHEN actocode IS NOT NULL AND actno IS NOT NULL
+                     THEN actocode || ':' || actno::text
+                     ELSE NULL
                 END
               ) AS act_label
           FROM {S}.tb_mr
@@ -45,10 +40,9 @@ def fetch_training_df(target: str) -> pd.DataFrame:
           mr.mrno AS {TARGET_MR},
           act.act_label AS {TARGET_ACT}
         FROM {S}.tb_por_detail d
-        LEFT JOIN mr_agg mr USING (pjtno, porser, porseq, revno)
+        LEFT JOIN mr_agg  mr  USING (pjtno, porser, porseq, revno)
         LEFT JOIN act_agg act USING (pjtno, porser, porseq, revno)
         """
-
         cur.execute(sql)
         rows = cur.fetchall()
         df = pd.DataFrame(rows)
@@ -58,11 +52,9 @@ def fetch_training_df(target: str) -> pd.DataFrame:
     if df.empty:
         raise ValueError("훈련 데이터가 비어 있습니다.")
 
-    # duration 숫자화
     if "duration" in df.columns:
         df["duration"] = pd.to_numeric(df["duration"], errors="coerce")
 
-    # 타겟 선택
     if target == "mr":
         df = df.dropna(subset=[TARGET_MR])
     elif target == "act":
@@ -72,12 +64,8 @@ def fetch_training_df(target: str) -> pd.DataFrame:
 
     return df
 
-
 def fetch_predict_df(header: Dict[str, Any]) -> pd.DataFrame:
-    """
-    header: {"pjtno":..., "porser":..., "porseq":..., "revno":...}
-    -> 해당 헤더의 tb_por_detail 라인들 로드 (예측 입력)
-    """
+    """지정한 헤더의 tb_por_detail 라인들을 로드하여 예측 입력으로 반환"""
     conn = get_conn(); cur = dict_cur(conn)
     try:
         sql = f"""

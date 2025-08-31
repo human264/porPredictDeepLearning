@@ -1,6 +1,5 @@
-#app/schemas.py
-from typing import Any, List, Optional
-from pydantic import BaseModel, ConfigDict, field_validator
+from typing import Any
+from pydantic import BaseModel, ConfigDict
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(protected_namespaces=())

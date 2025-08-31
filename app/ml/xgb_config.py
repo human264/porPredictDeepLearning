@@ -1,5 +1,3 @@
-# app/ml/xgb_config.py
-
 # 예측에 사용하지 않는 식별자 (조회/매칭용)
 ID_COLS = ["pjtno", "porser", "porseq", "revno"]
 

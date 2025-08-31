@@ -1,4 +1,3 @@
-#app/text.py
 import unicodedata, re
 import torch
 
@@ -48,7 +47,7 @@ def normalize_text(t: str) -> str:
     t = _ws.sub(" ", t).strip()
     return t
 
-def encode_text_to_tensor(text: str, max_len: int, device):
+def encode_text_to_tensor(text: str, max_len: int, device: torch.device):
     t = normalize_text(text)
     seq = []
     for ch in t:
