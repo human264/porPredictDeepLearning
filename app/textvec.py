@@ -1,4 +1,3 @@
-# app/textvec.py
 import os, re
 import numpy as np
 from sklearn.feature_extraction.text import HashingVectorizer

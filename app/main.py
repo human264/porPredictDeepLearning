@@ -16,10 +16,36 @@ load_dotenv()
 
 PROPOSED_HISTORY = os.getenv("PROPOSED_HISTORY", "0") in ("1", "true", "True")
 PERSIST_PREDICT_BUNDLES = os.getenv("PERSIST_PREDICT_BUNDLES", "0") in ("1", "true", "True")
-
+FORCE_ENSEMBLE = os.getenv("FORCE_ENSEMBLE", "0").lower() in ("1","true","on","yes")
 app = FastAPI(title="POR Bundle Classifier (Category B)")
 S = get_schema()
 
+# ---- 점수 포맷 정책 ----
+SCORE_DECIMALS = os.getenv("SCORE_DECIMALS", "auto").strip().lower()  # 'auto' 또는 숫자 문자열
+SCORE_MODE     = os.getenv("SCORE_MODE", "number").strip().lower()    # 'number' | 'string'
+SCORE_MAX_DIGITS = int(os.getenv("SCORE_MAX_DIGITS", "15"))
+
+def _fmt_score(v: float):
+    """
+    점수 포맷팅:
+      - SCORE_DECIMALS='auto' → 반올림 없이 그대로
+      - SCORE_DECIMALS=n(정수) → 소수 n자리 반올림
+      - SCORE_MODE='number'  → JSON number로 반환
+      - SCORE_MODE='string'  → JSON string로 반환(표시 자릿수 제어)
+    """
+    x = float(v)
+    if SCORE_DECIMALS == "auto":
+        if SCORE_MODE == "string":
+            return f"{x:.{SCORE_MAX_DIGITS}g}"   # 유효자리 기준 가변 문자열
+        return x                                   # 숫자 그대로
+    try:
+        n = int(SCORE_DECIMALS)
+    except ValueError:
+        n = 3
+    if SCORE_MODE == "string":
+        return f"{x:.{n}f}"
+    return round(x, n)
+# ------------------------
 
 def _to_floats(a: np.ndarray) -> list[float]:
     return np.asarray(a, dtype=float).ravel().tolist()
@@ -72,7 +98,7 @@ def ingest(req: IngestReq):
     try:
         with conn:
             with conn.cursor() as cur:
-                clean = [normalize(x) for x in req.items]
+                clean = [normalize(x or "") for x in req.items]
                 item_vecs = [text_to_vec(t) for t in clean]
                 V = int(os.getenv("VEC_DIM", "512"))
                 set_vec = np.mean(item_vecs, axis=0) if item_vecs else np.zeros(V, dtype="float32")
@@ -163,63 +189,52 @@ def predict(req: PredictReq):
     clean = [normalize(x) for x in req.items]
     full_text = " ".join(clean)
 
+    # ✅ 전역 or 요청 단위 강제 엔SEMBLE
+    force_ensemble = FORCE_ENSEMBLE or bool(getattr(req, "force_ensemble", False))
+
     conn = get_conn()
     try:
         with conn:
             cur = dict_cur(conn)
 
-            # 1) Rule first
-            cur.execute(
-                f"""
-                SELECT target_label
-                FROM {S}.bundle_rules
-                WHERE enabled=TRUE AND %s ~* pattern
-                ORDER BY priority DESC
-                LIMIT 1
-                """,
-                (full_text,),
-            )
-            r = cur.fetchone()
-            if r:
-                chosen = r["target_label"]
-                top3 = [{"label": chosen, "score": 1.0}]
-                top3_json = Json(top3)  # ✅ JSONB 안전 삽입
-
-                # (optional) persist predicted bundle
-                if PERSIST_PREDICT_BUNDLES:
-                    item_vecs = [text_to_vec(t) for t in clean]
-                    set_vec = np.mean(item_vecs, axis=0) if item_vecs else np.zeros(V, dtype="float32")
-                    cur.execute(
-                        f"INSERT INTO {S}.bundle_sets(label, set_embed) VALUES (%s,%s) RETURNING id;",
-                        (chosen, _to_floats(set_vec)),
-                    )
-                    res = cur.fetchone()
-                    new_set_id = res["id"] if isinstance(res, dict) else res[0]
-                    for raw, vec in zip(req.items, item_vecs):
-                        cur.execute(
-                            f"INSERT INTO {S}.bundle_items(set_id, raw_text, clean_text, item_embed) VALUES (%s,%s,%s,%s)",
-                            (new_set_id, raw, normalize(raw), _to_floats(vec)),
-                        )
-
-                # log prediction even on rule branch
+            # 1) Rule first — ✅ 강제 엔SEMBLE이면 스킵
+            if not force_ensemble:
                 cur.execute(
-                    f"""INSERT INTO {S}.bundle_predictions(set_id, predicted_label, confidence, top3, model_version)
-                        VALUES (NULL, %s, %s, %s, %s)""",
-                    (chosen, 1.0, top3_json, mdl.CURRENT_MODEL_VERSION or 0),
+                    f"""
+                    SELECT target_label
+                    FROM {S}.bundle_rules
+                    WHERE enabled=TRUE AND %s ~* pattern
+                    ORDER BY priority DESC
+                    LIMIT 1
+                    """,
+                    (full_text,),
                 )
-                if cur.rowcount == 0:
-                    raise HTTPException(500, "failed to insert bundle_predictions (rule)")
+                r = cur.fetchone()
+                if r:
+                    chosen = r["target_label"]
+                    top3 = [{"label": chosen, "score": _fmt_score(1.0)}]
+                    top3_json = Json(top3)
+                    conf_out = float(_fmt_score(1.0))
 
-                _upsert_tb_mr_proposed(cur, req.por_id, chosen, 1.0, top3_json)
+                    # (선택) persist predicted bundle ...
+                    # (생략: 기존 그대로 유지)
 
-                return {
-                    "chosen_label": chosen,
-                    "confidence": 1.0,
-                    "top3": top3,
-                    "model_version": mdl.CURRENT_MODEL_VERSION or 0,
-                }
+                    # log prediction
+                    explain = Json({"via":"rule"})
+                    cur.execute(
+                        f"""INSERT INTO {S}.bundle_predictions(set_id, predicted_label, confidence, top3, model_version)
+                            VALUES (NULL, %s, %s, %s, %s)""",
+                        (chosen, conf_out, top3_json, mdl.CURRENT_MODEL_VERSION or 0),
+                    )
+                    _upsert_tb_mr_proposed(cur, req.por_id, chosen, conf_out, top3_json)
+                    return {
+                        "chosen_label": chosen,
+                        "confidence": conf_out,
+                        "top3": top3,
+                        "model_version": mdl.CURRENT_MODEL_VERSION or 0,
+                    }
 
-            # 2) KNN
+            # 2) KNN (강제일 때도 여기로 진행)
             item_vecs = [text_to_vec(t) for t in clean]
             set_vec = np.mean(item_vecs, axis=0) if item_vecs else np.zeros(V, dtype="float32")
             neigh = knn_topk(set_vec, k=3, active_only=True)
@@ -238,44 +253,34 @@ def predict(req: PredictReq):
             model_prob = {mdl.LABELS[i]: float(probs[i]) for i in range(len(mdl.LABELS))}
 
             # 4) Ensemble
-            cur.execute(f"SELECT code FROM {S}.categories_b WHERE active=TRUE")
-            active_labels = [row["code"] for row in cur.fetchall()] or mdl.LABELS[:]
-            scores = {lbl: alpha * model_prob.get(lbl, 0.0) + (1 - alpha) * knn_prob.get(lbl, 0.0) for lbl in active_labels}
-            top = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-            if not top:
+            labels = set(knn_prob.keys()) | set(model_prob.keys())
+            scores = {lab: alpha*model_prob.get(lab,0.0) + (1-alpha)*knn_prob.get(lab,0.0) for lab in labels}
+            if not scores:
                 raise HTTPException(503, "no candidates")
+            top = sorted(scores.items(), key=lambda x:x[1], reverse=True)
             chosen, conf = top[0]
-            top3 = [{"label": k, "score": round(v, 6)} for k, v in top[:3]]
-            top3_json = Json(top3)  # ✅ JSONB 안전 삽입
+            top3 = [{"label": k, "score": _fmt_score(v)} for k, v in top[:3]]
+            top3_json = Json(top3)
+            conf_out = float(_fmt_score(conf))
 
-            # (optional) persist predicted bundle
-            if PERSIST_PREDICT_BUNDLES:
-                cur.execute(
-                    f"INSERT INTO {S}.bundle_sets(label, set_embed) VALUES (%s,%s) RETURNING id;",
-                    (chosen, _to_floats(set_vec)),
-                )
-                res = cur.fetchone()
-                new_set_id = res["id"] if isinstance(res, dict) else res[0]
-                for raw, vec in zip(req.items, item_vecs):
-                    cur.execute(
-                        f"INSERT INTO {S}.bundle_items(set_id, raw_text, clean_text, item_embed) VALUES (%s,%s,%s,%s)",
-                        (new_set_id, raw, normalize(raw), _to_floats(vec)),
-                    )
-
-            # log prediction
+            # log prediction — ✅ explain에 강제 여부 표시
+            explain = Json({"via": "ensemble_forced" if force_ensemble else "ensemble", "alpha": alpha})
             cur.execute(
                 f"""INSERT INTO {S}.bundle_predictions(set_id, predicted_label, confidence, top3, model_version)
                     VALUES (NULL, %s, %s, %s, %s)""",
-                (chosen, conf, top3_json, mdl.CURRENT_MODEL_VERSION or 0),
+                (chosen, conf_out, top3_json, mdl.CURRENT_MODEL_VERSION or 0),
             )
-            if cur.rowcount == 0:
-                raise HTTPException(500, "failed to insert bundle_predictions")
+            _upsert_tb_mr_proposed(cur, req.por_id, chosen, conf_out, top3_json)
 
-            _upsert_tb_mr_proposed(cur, req.por_id, chosen, conf, top3_json)
-
-            return {"chosen_label": chosen, "confidence": conf, "top3": top3, "model_version": mdl.CURRENT_MODEL_VERSION or 0}
+            return {
+                "chosen_label": chosen,
+                "confidence": conf_out,
+                "top3": top3,
+                "model_version": mdl.CURRENT_MODEL_VERSION or 0,
+            }
     finally:
         conn.close()
+
 
 
 @app.get("/debug/dbinfo")

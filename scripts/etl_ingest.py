@@ -59,7 +59,7 @@ def open_training_stream(rconn) -> RealDictCursor:
             sql.Identifier(SCHEMA)
         )
         cur.execute(q)
-        print(f"[etl] using view {SCHEMA}.vw_mr_training")
+        print(f"[etl] using view {SCHEMA}.vw_mr_training", file=sys.stderr)
     else:
         q = sql.SQL("""
             SELECT
@@ -71,7 +71,7 @@ def open_training_stream(rconn) -> RealDictCursor:
             GROUP BY m.por_id, m.category_code
         """).format(sql.Identifier(SCHEMA), sql.Identifier(SCHEMA))
         cur.execute(q)
-        print(f"[etl] fallback join {SCHEMA}.tb_por_detail ↔ {SCHEMA}.tb_mr")
+        print(f"[etl] fallback join {SCHEMA}.tb_por_detail ↔ {SCHEMA}.tb_mr", file=sys.stderr)
     return cur
 
 
@@ -79,11 +79,10 @@ def ingest_via_api(rows) -> int:
     """API(/bundle/ingest)로 적재"""
     n = 0
     for r in rows:
-        resp = requests.post(
-            API,
-            json={"label": r["label"], "items": r["items"]},
-            timeout=30,
-        )
+        payload = {"label": r["label"], "items": r["items"]}
+        resp = requests.post(API, json=payload, timeout=30)
+        if resp.status_code >= 400:
+            print("[etl] API error", resp.status_code, resp.text, file=sys.stderr)
         resp.raise_for_status()
         n += 1
     return n
@@ -106,30 +105,25 @@ def ingest_direct_db(wconn, rows) -> int:
     for r in rows:
         label = r["label"]
         items = r["items"] or []
-        clean = [normalize(x) for x in items]
+        clean = [normalize(x or "") for x in items]
         item_vecs = [text_to_vec(t) for t in clean]  # 각 요소 dtype=float32일 수 있음
 
-        V = VEC_DIM
         if item_vecs:
-            import numpy as np
             set_vec = np.mean(item_vecs, axis=0)
         else:
-            import numpy as np
-            set_vec = np.zeros(V, dtype="float32")
+            set_vec = np.zeros(VEC_DIM, dtype="float32")
 
-        # ✅ Python float 리스트로 변환
-        set_vec_py = to_py_float_list(set_vec)
-
+        # ✅ Python float 리스트로 변환 + 스키마 접두사
         cur.execute(
-            "INSERT INTO bundle_sets(label, set_embed) VALUES (%s,%s) RETURNING id;",
-            (label, set_vec_py),
+            f"INSERT INTO {SCHEMA}.bundle_sets(label, set_embed) VALUES (%s,%s) RETURNING id;",
+            (label, to_py_float_list(set_vec)),
         )
         set_id = cur.fetchone()[0]
 
         for raw, c, v in zip(items, clean, item_vecs):
             cur.execute(
-                """
-                INSERT INTO bundle_items(set_id, raw_text, clean_text, item_embed)
+                f"""
+                INSERT INTO {SCHEMA}.bundle_items(set_id, raw_text, clean_text, item_embed)
                 VALUES (%s,%s,%s,%s)
                 """,
                 (set_id, raw, c, to_py_float_list(v)),
@@ -160,9 +154,9 @@ def main():
         # API 준비 확인
         use_api = api_ready(timeout_sec=5)
         if use_api:
-            print(f"[etl] API ready → {API}")
+            print(f"[etl] API ready → {API}", file=sys.stderr)
         else:
-            print(f"[etl] API NOT ready → DIRECT DB ingest mode")
+            print(f"[etl] API NOT ready → DIRECT DB ingest mode", file=sys.stderr)
 
         while True:
             rows = cur.fetchmany(CHUNK)
@@ -173,7 +167,7 @@ def main():
                 try:
                     total += ingest_via_api(rows)
                 except requests.exceptions.RequestException as e:
-                    print(f"[etl] API error → switching to DIRECT mode: {e}")
+                    print(f"[etl] API error → switching to DIRECT mode: {e}", file=sys.stderr)
                     total += ingest_direct_db(wconn, rows)
                     use_api = False
             else:
@@ -186,7 +180,8 @@ def main():
         rconn.close()
         wconn.close()
 
-    print("ingested bundles:", total)
+    # 진행 메시지는 stderr로 출력 (jq와 충돌 방지)
+    print(f"ingested bundles: {total}", file=sys.stderr)
 
 
 if __name__ == "__main__":

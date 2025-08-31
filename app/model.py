@@ -13,37 +13,30 @@ def _select_device():
         return torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
     if pref == "cuda":
         return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    if pref == "cpu":
-        return torch.device("cpu")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
     return torch.device("cpu")
 
 DEVICE = _select_device()
-print(f"[model] DEVICE={DEVICE}; mps_avail={torch.backends.mps.is_available()}; mps_built={torch.backends.mps.is_built()}")
+print(f"[model] DEVICE={DEVICE}; mps_avail={torch.backends.mps.is_available()}")
 
+# ---------- 문자 집합 ----------
 CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789 .-/%xdiam"
-char_to_idx = {c: i+1 for i, c in enumerate(CHARSET)}
+char_to_idx = {c: i+1 for i, c in enumerate(CHARSET)}  # 0은 <unk>/<pad>
 VOCAB_SIZE = len(char_to_idx) + 1
 
 def encode_text_to_tensor(text: str, max_len: int):
     s = (text or "")[:max_len]
     return torch.tensor([char_to_idx.get(ch, 0) for ch in s], dtype=torch.long, device=DEVICE)
 
-def _get_kernel_sizes():
-    ks = os.getenv("CNN_KERNEL_SIZES", "2,3,4,5").strip()
-    try:
-        return tuple(int(x) for x in ks.split(",") if x.strip())
-    except Exception:
-        return (2,3,4,5)
+def _kernels():
+    ks = os.getenv("CNN_KERNEL_SIZES", "2,3,4,5")
+    return tuple(int(x) for x in ks.split(",") if x.strip())
 
 EMB_DIM = int(os.getenv("CNN_EMB_DIM", "48"))
 OUT_CH  = int(os.getenv("CNN_OUT_CH",  "64"))
-KERNELS = _get_kernel_sizes()
+KERNELS = _kernels()
 DROPOUT = float(os.getenv("CNN_DROPOUT", "0.1"))
 
+# ---------- 순수 CNN 인코더/분류기 ----------
 class ItemCNNEncoder(nn.Module):
     def __init__(self, vocab_size, emb_dim=EMB_DIM, out_ch=OUT_CH, kernels=KERNELS, dropout=DROPOUT):
         super().__init__()
@@ -57,10 +50,10 @@ class ItemCNNEncoder(nn.Module):
         x = x.transpose(0,1).unsqueeze(0) # (1,E,L)
         feats = []
         for conv in self.convs:
-            h = F.relu(conv(x))           # (1,C,L')
+            h = torch.relu(conv(x))       # (1,C,L')
             h = torch.max(h, dim=2)[0]    # (1,C)
             feats.append(h)
-        z = torch.cat(feats, dim=1)       # (1, C*|kernels|)
+        z = torch.cat(feats, dim=1)       # (1,C*|kernels|)
         z = self.dropout(z)
         return z.squeeze(0)               # (C*|kernels|,)
 
@@ -78,8 +71,9 @@ class SetCNNClassifier(nn.Module):
         Svec = torch.mean(M, dim=0)
         return self.fc(Svec)
 
+# ---------- 전역 상태 ----------
 MODEL = None
-LABELS = []
+LABELS = []              # ["B1","B2",...]
 CURRENT_MODEL_VERSION = None
 
 def _save_model(ver: int, model: nn.Module, label_list):
@@ -87,62 +81,62 @@ def _save_model(ver: int, model: nn.Module, label_list):
     path = f"./models/model_v{ver}.pt"
     torch.save(model.state_dict(), path)
     conn = get_conn(); cur = dict_cur(conn)
-    cur.execute(f"UPDATE {S}.model_versions SET details = %s WHERE version_id = %s",
-                (json.dumps({"label_list": label_list, "charset": CHARSET,
-                             "arch": "TextCNN", "kernels": KERNELS,
-                             "emb_dim": EMB_DIM, "out_ch": OUT_CH}), ver))
+    cur.execute(
+        f"UPDATE {S}.model_versions SET details = %s WHERE version_id = %s",
+        (json.dumps({"label_list": label_list, "arch":"TextCNN"}), ver)
+    )
     conn.commit(); cur.close(); conn.close()
     return path
 
 def load_latest_model():
+    """최신 버전 모델 로드(카테고리 B)"""
     global MODEL, LABELS, CURRENT_MODEL_VERSION
     conn = get_conn(); cur = dict_cur(conn)
     cur.execute(f"SELECT version_id, details FROM {S}.model_versions ORDER BY version_id DESC LIMIT 1;")
     row = cur.fetchone(); cur.close(); conn.close()
     if not row:
-        MODEL = None; LABELS = []; CURRENT_MODEL_VERSION = None
-        print("[model] no model_versions row -> cold start")
-        return
+        MODEL = None; LABELS = []; CURRENT_MODEL_VERSION = None; return
     ver, details = row["version_id"], (row["details"] or {})
     label_list = details.get("label_list", [])
     model = SetCNNClassifier(VOCAB_SIZE, len(label_list)).to(DEVICE)
-    path = f"./models/model_v{ver}.pt"
     try:
-        state = torch.load(path, map_location=DEVICE)
+        state = torch.load(f"./models/model_v{ver}.pt", map_location=DEVICE)
         model.load_state_dict(state, strict=False)
     except Exception as e:
-        print(f"[model] load non-strict failed or partial: {e}")
+        print("[model] load warning:", e)
     model.eval()
     MODEL = model; LABELS = label_list; CURRENT_MODEL_VERSION = ver
 
 def train_streaming():
+    """bundle_sets/bundle_items 기반 스트리밍 학습 (카테고리 B)"""
     from psycopg2.extras import RealDictCursor
-    import torch
-
     ACCUM_STEPS = int(os.getenv("ACCUM_STEPS", "4"))
-    EPOCHS = int(os.getenv("EPOCHS", "3"))
-    LR = float(os.getenv("LEARNING_RATE", "0.001"))
+    EPOCHS      = int(os.getenv("EPOCHS", "3"))
+    LR          = float(os.getenv("LEARNING_RATE", "0.001"))
     MAX_ITEM_LEN = int(os.getenv("MAX_ITEM_LEN", "512"))
     MAX_ITEMS_PER_BUNDLE = int(os.getenv("MAX_ITEMS_PER_BUNDLE", "64"))
 
     conn = get_conn(); cur = dict_cur(conn)
+    # ✅ 활성 라벨: categories_b.active = TRUE
     cur.execute(f"SELECT code FROM {S}.categories_b WHERE active = TRUE ORDER BY code;")
     label_list = [r["code"] for r in cur.fetchall()]
     label_to_idx = {c:i for i,c in enumerate(label_list)}
     num_classes = len(label_list)
 
+    # 새 버전 생성
     cur.execute(f"INSERT INTO {S}.model_versions(details) VALUES ('{{}}') RETURNING version_id;")
     ver = cur.fetchone()["version_id"]; conn.commit()
 
     model = SetCNNClassifier(VOCAB_SIZE, num_classes).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
-    loss_fn = torch.nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss()
 
     for ep in range(EPOCHS):
         stream = conn.cursor(name=f"ep{ep}_cursor", cursor_factory=RealDictCursor, withhold=True)
         stream.itersize = 512
         stream.execute(f"""
-          SELECT s.id AS set_id, s.label, array_agg(i.clean_text ORDER BY i.id) AS items
+          SELECT s.id AS set_id, s.label,
+                 array_agg(i.clean_text ORDER BY i.id) AS items
           FROM {S}.bundle_sets s
           JOIN {S}.bundle_items i ON i.set_id = s.id
           WHERE s.label = ANY(%s)
