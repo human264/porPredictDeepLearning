@@ -1,0 +1,23 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="langchain" />
+          <option value="langgraph" />
+          <option value="langchain-openai" />
+          <option value="langchain-community" />
+          <option value="langchain-chroma" />
+          <option value="langchain-ollama" />
+          <option value="langchain-google-genai" />
+          <option value="langchain-groq" />
+          <option value="gradio" />
+          <option value="python-dotenv" />
+          <option value="bs4" />
+          <option value="wikipedia" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>

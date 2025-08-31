@@ -1,0 +1,22 @@
+services:
+  db:
+    image: ankane/pgvector:latest   # PostgreSQL 16 + pgvector 포함 이미지
+    container_name: pgvector_db
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "5432:5432"
+    volumes:
+      # 최초 기동 시 아래 SQL이 자동 실행됩니다.
+      - ./setup_with_dummy.sql.sql:/docker-entrypoint-initdb.d/10_setup_with_dummy.sql:ro
+      # 데이터 영속화
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pg_data:
