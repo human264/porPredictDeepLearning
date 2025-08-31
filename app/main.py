@@ -14,13 +14,14 @@ import app.model as mdl
 load_dotenv()
 
 PROPOSED_HISTORY = os.getenv("PROPOSED_HISTORY", "0") in ("1", "true", "True")
-FORCE_ENSEMBLE = os.getenv("FORCE_ENSEMBLE", "0").lower() in ("1","true","on","yes")
+FORCE_ENSEMBLE = os.getenv("FORCE_ENSEMBLE", "0").lower() in ("1", "true", "on", "yes")
 app = FastAPI(title="POR Activity Classifier")
 S = get_schema()
 
 SCORE_DECIMALS = os.getenv("SCORE_DECIMALS", "auto").strip().lower()
-SCORE_MODE     = os.getenv("SCORE_MODE", "number").strip().lower()
+SCORE_MODE = os.getenv("SCORE_MODE", "number").strip().lower()
 SCORE_MAX_DIGITS = int(os.getenv("SCORE_MAX_DIGITS", "15"))
+
 
 def _fmt_score(v: float):
     x = float(v)
@@ -36,25 +37,36 @@ def _fmt_score(v: float):
         return f"{x:.{n}f}"
     return round(x, n)
 
+
 def _to_floats(a: np.ndarray) -> list[float]:
     return np.asarray(a, dtype=float).ravel().tolist()
+
 
 @app.on_event("startup")
 def _startup():
     mdl.load_latest_model()
 
+
 @app.get("/debug/dbinfo")
 def debug_dbinfo():
-    conn = get_conn(); cur = dict_cur(conn)
+    conn = get_conn();
+    cur = dict_cur(conn)
     try:
-        cur.execute("SELECT current_user, session_user"); u = cur.fetchone()
-        cur.execute("SELECT current_database() AS db, inet_server_addr()::text AS host, inet_server_port() AS port"); d = cur.fetchone()
-        cur.execute("SHOW search_path"); sp = cur.fetchone()
-        cur.execute("SELECT version() AS ver"); ver = cur.fetchone()
-        cur.execute("SELECT extname FROM pg_catalog.pg_extension ORDER BY 1"); exts = [r["extname"] for r in cur.fetchall()]
+        cur.execute("SELECT current_user, session_user");
+        u = cur.fetchone()
+        cur.execute("SELECT current_database() AS db, inet_server_addr()::text AS host, inet_server_port() AS port");
+        d = cur.fetchone()
+        cur.execute("SHOW search_path");
+        sp = cur.fetchone()
+        cur.execute("SELECT version() AS ver");
+        ver = cur.fetchone()
+        cur.execute("SELECT extname FROM pg_catalog.pg_extension ORDER BY 1");
+        exts = [r["extname"] for r in cur.fetchall()]
         return {"user": u, "db": d, "search_path": sp, "version": ver, "extensions": exts, "schema": S}
     finally:
-        cur.close(); conn.close()
+        cur.close();
+        conn.close()
+
 
 # (옵션) 수동 주입
 @app.post("/bundle/ingest")
@@ -86,6 +98,7 @@ def ingest(req: IngestReq):
     finally:
         conn.close()
 
+
 @app.post("/bundle_rules")
 def upsert_rule(req: RuleUpsertReq):
     conn = get_conn()
@@ -108,19 +121,23 @@ def upsert_rule(req: RuleUpsertReq):
     finally:
         conn.close()
 
+
 @app.post("/bundle/train", response_model=TrainResp)
 def train():
     ver, _ = mdl.train_streaming()
     mdl.load_latest_model()
     return {"status": "trained", "model_version": ver}
 
+
 # 학습셋으로 bundle_sets(임베딩) 재구성 → KNN용
 @app.post("/bundle/rebuild_sets", response_model=RebuildSetsResp)
 def rebuild_sets():
     from app.textvec import normalize, text_to_vec
     V = int(os.getenv("VEC_DIM", "512"))
-    inserted = 0; updated = 0
-    conn = get_conn(); cur = dict_cur(conn)
+    inserted = 0;
+    updated = 0
+    conn = get_conn();
+    cur = dict_cur(conn)
     try:
         # 학습 뷰에서 헤더/활동별 items 가져와 set_embed 생성
         cur.execute(f"SELECT pjtno,porser,porseq,revno,actocode,actno,items FROM {S}.vw_training_activity")
@@ -139,7 +156,7 @@ def rebuild_sets():
                             WHERE pjtno=%s AND porser=%s AND porseq=%s AND revno=%s
                               AND label_actocode=%s AND label_actno=%s
                             LIMIT 1;""",
-                        (r["pjtno"],r["porser"],r["porseq"],r["revno"],r["actocode"],r["actno"])
+                        (r["pjtno"], r["porser"], r["porseq"], r["revno"], r["actocode"], r["actno"])
                     )
                     ex = c.fetchone()
                     if ex:
@@ -153,19 +170,23 @@ def rebuild_sets():
                             f"""INSERT INTO {S}.bundle_sets
                                 (pjtno,porser,porseq,revno,label_actocode,label_actno,set_embed)
                                 VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-                            (r["pjtno"],r["porser"],r["porseq"],r["revno"],r["actocode"],r["actno"], _to_floats(set_vec))
+                            (r["pjtno"], r["porser"], r["porseq"], r["revno"], r["actocode"], r["actno"],
+                             _to_floats(set_vec))
                         )
                         inserted += 1
-        return {"status":"ok","inserted":inserted,"updated":updated}
+        return {"status": "ok", "inserted": inserted, "updated": updated}
     finally:
-        cur.close(); conn.close()
+        cur.close();
+        conn.close()
+
 
 def _apply_rule_if_any(full_text: str, header: dict):
     """
     룰 매칭: pattern ~* full_text
     + where_* 가 NULL이거나, tb_por_detail에 동일 값/범위 존재
     """
-    conn = get_conn(); cur = dict_cur(conn)
+    conn = get_conn();
+    cur = dict_cur(conn)
     try:
         cur.execute(
             f"""
@@ -208,7 +229,9 @@ def _apply_rule_if_any(full_text: str, header: dict):
         r = cur.fetchone()
         return (r["target_actocode"], r["target_actno"]) if r else None
     finally:
-        cur.close(); conn.close()
+        cur.close();
+        conn.close()
+
 
 @app.post("/bundle/predict", response_model=PredictResp)
 def predict(req: PredictReq):
@@ -226,7 +249,8 @@ def predict(req: PredictReq):
     if req.pjtno and req.porser and req.porseq and req.revno:
         header = {"pjtno": req.pjtno, "porser": req.porser, "porseq": req.porseq, "revno": req.revno}
         # POR 라인에서 아이템 구성
-        conn = get_conn(); cur = dict_cur(conn)
+        conn = get_conn();
+        cur = dict_cur(conn)
         try:
             cur.execute(
                 f"""SELECT item_name, spec_text FROM {S}.tb_por_detail
@@ -237,7 +261,8 @@ def predict(req: PredictReq):
             rows = cur.fetchall()
             items = [(" ".join([r["item_name"] or "", r["spec_text"] or ""])).strip() for r in rows]
         finally:
-            cur.close(); conn.close()
+            cur.close();
+            conn.close()
     elif req.items:
         items = req.items
     else:
@@ -280,10 +305,10 @@ def predict(req: PredictReq):
 
     # 5) Ensemble
     labels = set(knn_prob.keys()) | set(model_prob.keys())
-    scores = {lab: alpha*model_prob.get(lab,0.0) + (1-alpha)*knn_prob.get(lab,0.0) for lab in labels}
+    scores = {lab: alpha * model_prob.get(lab, 0.0) + (1 - alpha) * knn_prob.get(lab, 0.0) for lab in labels}
     if not scores:
         raise HTTPException(503, "no candidates")
-    top = sorted(scores.items(), key=lambda x:x[1], reverse=True)
+    top = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     best_key, conf = top[0]
     actocode, actno = best_key.split(":", 1)
     top3 = [{"label": k, "score": _fmt_score(v)} for k, v in top[:3]]
@@ -295,6 +320,7 @@ def predict(req: PredictReq):
 
     return {"actocode": actocode, "actno": actno, "confidence": conf_out,
             "top3": top3, "model_version": mdl.CURRENT_MODEL_VERSION or 0}
+
 
 def _log_pred(header, actocode, actno, conf: float, top3_json, via="ensemble", alpha=None):
     conn = get_conn()
@@ -308,11 +334,12 @@ def _log_pred(header, actocode, actno, conf: float, top3_json, via="ensemble", a
                         f"""INSERT INTO {S}.bundle_predictions
                             (pjtno,porser,porseq,revno,predicted_actocode,predicted_actno,confidence,top3,model_version,explain)
                             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        (header["pjtno"],header["porser"],header["porseq"],header["revno"],
-                         actocode,actno,conf, top3_json, mdl.CURRENT_MODEL_VERSION or 0, Json(explain))
+                        (header["pjtno"], header["porser"], header["porseq"], header["revno"],
+                         actocode, actno, conf, top3_json, mdl.CURRENT_MODEL_VERSION or 0, Json(explain))
                     )
     finally:
         conn.close()
+
 
 def _upsert_proposed(header, actocode, actno, confidence, top3_json):
     if not header:
@@ -336,8 +363,8 @@ def _upsert_proposed(header, actocode, actno, confidence, top3_json):
                         model_version = EXCLUDED.model_version,
                         predicted_at  = NOW()
                     """,
-                    (header["pjtno"],header["porser"],header["porseq"],header["revno"],
-                     actocode,actno, actocode,actno, confidence, top3_json, mdl.CURRENT_MODEL_VERSION or 0)
+                    (header["pjtno"], header["porser"], header["porseq"], header["revno"],
+                     actocode, actno, actocode, actno, confidence, top3_json, mdl.CURRENT_MODEL_VERSION or 0)
                 )
                 if PROPOSED_HISTORY:
                     cur.execute(
@@ -349,8 +376,8 @@ def _upsert_proposed(header, actocode, actno, confidence, top3_json):
                            (SELECT name FROM {S}.activity_codes WHERE actocode=%s AND actno=%s),
                            %s,%s,%s)
                         """,
-                        (header["pjtno"],header["porser"],header["porseq"],header["revno"],
-                         actocode,actno, actocode,actno, confidence, top3_json, mdl.CURRENT_MODEL_VERSION or 0)
+                        (header["pjtno"], header["porser"], header["porseq"], header["revno"],
+                         actocode, actno, actocode, actno, confidence, top3_json, mdl.CURRENT_MODEL_VERSION or 0)
                     )
     finally:
         conn.close()
