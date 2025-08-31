@@ -329,6 +329,7 @@ def train_items(task: str) -> Tuple[int, int]:
 
     # 라벨 공간
     conn = get_conn(); cur = dict_cur(conn)
+
     if task == "item_act":
         cur.execute(f"SELECT actocode, actno FROM {S}.activity_codes WHERE active=TRUE ORDER BY actocode, actno")
         labs_master = [f"{r['actocode']}:{r['actno']}" for r in cur.fetchall()]
